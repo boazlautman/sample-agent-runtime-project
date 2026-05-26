@@ -1,0 +1,214 @@
+name: AgentGuard Code Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  pull-requests: write
+
+jobs:
+  agentguard-code-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Start AgentGuard run
+        id: agentguard
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          async function githubOidcToken() {
+            const response = await fetch(process.env.ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=agentguard-code-security', {
+              headers: { authorization: 'bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }
+            });
+            if (!response.ok) throw new Error('GitHub OIDC token request failed: ' + response.status);
+            const data = await response.json();
+            return data.value;
+          }
+          async function main() {
+            const token = await githubOidcToken();
+            const payload = {
+              repository: process.env.GITHUB_REPOSITORY,
+              branch: process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME,
+              ref: process.env.GITHUB_REF,
+              sha: process.env.GITHUB_SHA,
+              pullRequest: process.env.GITHUB_EVENT_NAME === 'pull_request' ? JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).number : undefined
+            };
+            const response = await fetch('https://api.fullcourtdefense.ai/api/code-security/runs/start', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+              body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (!data.success) throw new Error(data.error || 'AgentGuard start failed');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'run_id=' + data.data.run.id + '\n');
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          NODE
+
+      # Fast PR gate: high-signal static, secrets, dependency, and IaC checks.
+      # AgentGuard reports everything but blocks only confirmed high/critical policy matches.
+      - name: Run Semgrep
+        continue-on-error: true
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/security
+            p/owasp-top-ten
+            p/secrets
+          generateSarif: "1"
+
+      - name: Run Gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Run OSV dependency scan
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: --format sarif --output osv-results.sarif .
+
+      - name: Run Trivy filesystem scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Run Checkov
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12.3102.0
+        with:
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      # Deep scan: SBOM + supply-chain analysis. Runs on schedule/manual, or when explicitly enabled.
+      - name: Generate SBOM with Syft
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.AGENTGUARD_DEEP_SCAN == 'true'
+        continue-on-error: true
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: syft-sbom.spdx.json
+
+      - name: Run Grype SBOM scan
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.AGENTGUARD_DEEP_SCAN == 'true'
+        continue-on-error: true
+        uses: anchore/scan-action@v6
+        with:
+          path: .
+          output-format: sarif
+          output-file: grype-results.sarif
+          fail-build: false
+
+      # Optional deep dataflow. AgentGuard setup enables this only when repo language + GitHub plan support it.
+      - name: Initialize CodeQL
+        if: vars.AGENTGUARD_CODEQL_LANGUAGES != ''
+        continue-on-error: true
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ vars.AGENTGUARD_CODEQL_LANGUAGES }}
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild for CodeQL
+        if: vars.AGENTGUARD_CODEQL_LANGUAGES != ''
+        continue-on-error: true
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze with CodeQL
+        if: vars.AGENTGUARD_CODEQL_LANGUAGES != ''
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+
+      # Runtime checks are opt-in and scoped. AgentGuard sets this only for approved staging/preview URLs.
+      - name: Run Nuclei runtime checks
+        if: vars.AGENTGUARD_RUNTIME_TARGET != ''
+        continue-on-error: true
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ vars.AGENTGUARD_RUNTIME_TARGET }}
+          flags: -severity critical,high -sarif-export nuclei-results.sarif
+
+      - name: Run ZAP baseline scan
+        if: vars.AGENTGUARD_RUNTIME_TARGET != ''
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ vars.AGENTGUARD_RUNTIME_TARGET }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: -a -j -l WARN
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+
+      - name: Send results to AgentGuard
+        if: always()
+        env:
+          AGENTGUARD_RUN_ID: ${{ steps.agentguard.outputs.run_id }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          async function githubOidcToken() {
+            const response = await fetch(process.env.ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=agentguard-code-security', {
+              headers: { authorization: 'bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }
+            });
+            if (!response.ok) throw new Error('GitHub OIDC token request failed: ' + response.status);
+            const data = await response.json();
+            return data.value;
+          }
+          const files = [
+            ['semgrep', 'semgrep.sarif'],
+            ['trivy', 'trivy-results.sarif'],
+            ['osv-scanner', 'osv-results.sarif'],
+            ['checkov', 'checkov-results.sarif'],
+            ['grype', 'grype-results.sarif'],
+            ['nuclei', 'nuclei-results.sarif']
+          ];
+          async function post(token, tool, sarif) {
+            const response = await fetch('https://api.fullcourtdefense.ai/api/code-security/runs/' + process.env.AGENTGUARD_RUN_ID + '/upload', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+              body: JSON.stringify({ tool, sarif })
+            });
+            const data = await response.json();
+            if (!data.success) throw new Error(data.error || 'AgentGuard upload failed');
+            return data.data.gateDecision;
+          }
+          async function main() {
+            const token = await githubOidcToken();
+            let lastDecision = { decision: 'pass', blockingFindings: 0, reason: 'No uploaded findings.' };
+            for (const [tool, file] of files) {
+              if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+                lastDecision = await post(token, tool, JSON.parse(fs.readFileSync(file, 'utf8')));
+              }
+            }
+            const complete = await fetch('https://api.fullcourtdefense.ai/api/code-security/runs/' + process.env.AGENTGUARD_RUN_ID + '/complete', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+              body: JSON.stringify({ status: 'completed' })
+            }).then(r => r.json());
+            if (!complete.success) throw new Error(complete.error || 'AgentGuard complete failed');
+            const decision = complete.data.gateDecision || lastDecision;
+            console.log(decision.reason);
+            if (decision.decision === 'fail') process.exit(1);
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          NODE
