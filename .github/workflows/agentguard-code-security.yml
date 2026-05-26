@@ -196,7 +196,7 @@ jobs:
             const token = await githubOidcToken();
             let lastDecision = { decision: 'pass', blockingFindings: 0, reason: 'No uploaded findings.' };
             for (const [tool, file] of files) {
-              if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+              if (fs.existsSync(file)) {
                 lastDecision = await post(token, tool, JSON.parse(fs.readFileSync(file, 'utf8')));
               }
             }
