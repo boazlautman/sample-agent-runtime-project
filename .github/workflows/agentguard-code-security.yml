@@ -3,7 +3,7 @@ name: AgentGuard Code Security
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ['main']
   workflow_dispatch:
 
 permissions:
@@ -71,8 +71,12 @@ jobs:
           generateSarif: "1"
 
       - name: Run secret exposure analysis
+        id: gitleaks
         continue-on-error: true
-        uses: gitleaks/gitleaks-action@v2
+        uses: DariuszPorowski/github-action-gitleaks@v2
+        with:
+          report_format: sarif
+          fail: false
 
       - name: Run dependency advisory analysis
         continue-on-error: true
@@ -136,6 +140,8 @@ jobs:
         if: vars.AGENTGUARD_CODEQL_LANGUAGES != ''
         continue-on-error: true
         uses: github/codeql-action/analyze@v3
+        # CodeQL publishes results to GitHub code scanning directly. AgentGuard
+        # ingests scanner-owned SARIF files below when tools write a stable path.
 
       # Runtime checks are opt-in and scoped. AgentGuard sets this only for approved staging/preview URLs.
       - name: Run runtime infrastructure analysis
@@ -159,6 +165,7 @@ jobs:
         if: always()
         env:
           AGENTGUARD_RUN_ID: ${{ steps.agentguard.outputs.run_id }}
+          GITLEAKS_REPORT: ${{ steps.gitleaks.outputs.output }}
         run: |
           node - <<'NODE'
           const fs = require('fs');
@@ -172,12 +179,13 @@ jobs:
             return data.value;
           }
           const files = [
-            ['semgrep', 'semgrep.sarif'],
-            ['trivy', 'trivy-results.sarif'],
-            ['osv-scanner', 'osv-results.sarif'],
-            ['checkov', 'checkov-results.sarif'],
-            ['grype', 'grype-results.sarif'],
-            ['nuclei', 'nuclei-results.sarif']
+            ['semgrep', ['semgrep.sarif']],
+            ['gitleaks', [process.env.GITLEAKS_REPORT, 'gitleaks.sarif', 'gitleaks-results.sarif']],
+            ['trivy', ['trivy-results.sarif']],
+            ['osv-scanner', ['osv-results.sarif']],
+            ['checkov', ['checkov-results.sarif']],
+            ['grype', ['grype-results.sarif']],
+            ['nuclei', ['nuclei-results.sarif']]
           ];
           async function post(token, tool, sarif) {
             const response = await fetch('https://api.fullcourtdefense.ai/api/code-security/runs/' + process.env.AGENTGUARD_RUN_ID + '/upload', {
@@ -192,8 +200,9 @@ jobs:
           async function main() {
             const token = await githubOidcToken();
             let lastDecision = { decision: 'pass', blockingFindings: 0, reason: 'No uploaded findings.' };
-            for (const [tool, file] of files) {
-              if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+            for (const [tool, candidates] of files) {
+              const file = candidates.filter(Boolean).find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+              if (file) {
                 lastDecision = await post(token, tool, JSON.parse(fs.readFileSync(file, 'utf8')));
               }
             }
